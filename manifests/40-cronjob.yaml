@@ -36,10 +36,11 @@ spec:
           containers:
             - name: approver
               # ose-cli-rhel9 は registry.redhat.io への terms acceptance が必要で
-              # registry.access.redhat.com からは認証なしで pull できないため、
-              # 認証不要な ubi10-minimal を使い、起動時に OpenShift mirror から
+              # registry.access.redhat.com からは認証なしで pull できない。
+              # ubi-minimal は tar/gzip を含まないため oc 取得時に解凍できない。
+              # tar/gzip 同梱の full UBI を使い、起動時に OpenShift mirror から
               # oc バイナリを取得する (詳細は approve.sh の bootstrap セクション参照)
-              image: registry.access.redhat.com/ubi10/ubi-minimal:latest
+              image: registry.access.redhat.com/ubi10/ubi:latest
               imagePullPolicy: IfNotPresent
               command:
                 - /bin/bash
