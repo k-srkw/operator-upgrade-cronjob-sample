@@ -1,0 +1,1 @@
+# operator-upgrade-cronjob-sample
