@@ -20,7 +20,7 @@ OpenShift で `installPlanApproval: Manual` に設定された Operator Subscrip
 |---|---|
 | `manifests/00-namespace.yaml` | Namespace `operator-upgrade-approver` |
 | `manifests/10-serviceaccount.yaml` | ServiceAccount `installplan-approver` |
-| `manifests/20-clusterrole.yaml` | ClusterRole (subscriptions: get/list、installplans: get/list/patch) |
+| `manifests/20-clusterrole.yaml` | ClusterRole (subscriptions: get/list、installplans: get/list/patch、clusterversions: get) |
 | `manifests/21-clusterrolebinding.yaml` | ClusterRoleBinding |
 | `manifests/30-configmap-allowlist.yaml` | 許可リスト (運用者が編集する箇所) |
 | `manifests/31-configmap-script.yaml` | 承認スクリプト `approve.sh` |
@@ -35,7 +35,11 @@ OpenShift で `installPlanApproval: Manual` に設定された Operator Subscrip
 - Job Pod から OpenShift mirror (`https://mirror.openshift.com`) へ HTTPS で
   アクセスできること。UBI には `oc` が同梱されないため、起動時に
   `openshift-client-linux.tar.gz` を取得して `/tmp/bin/oc` に展開する。
-  別 URL を指定したい場合は CronJob の env に `OC_CLIENT_URL` を設定する
+  起動時に in-cluster API から `ClusterVersion` を読み、クラスタと同じ y-stream
+  (z は最新) の oc クライアントを取得する。検出に失敗した場合は `stable` チャネルに
+  fallback。任意の URL に固定したい場合は CronJob の env に `OC_CLIENT_URL` を設定する。
+- ClusterRole `installplan-approver` に `clusterversions.config.openshift.io` の
+  `get` 権限を付与済み (y-stream 検出に使用)
 
 ## デプロイ手順
 

@@ -21,3 +21,10 @@ rules:
       - get
       - list
       - patch
+  # クラスタの OCP バージョンを参照して同じ y-stream の oc クライアントを取得するため
+  - apiGroups:
+      - config.openshift.io
+    resources:
+      - clusterversions
+    verbs:
+      - get

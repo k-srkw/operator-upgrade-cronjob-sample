@@ -25,8 +25,15 @@ data:
     set -o pipefail
 
     ALLOWLIST_FILE="/etc/approver/allowlist/allowlist"
-    OC_CLIENT_URL="${OC_CLIENT_URL:-https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz}"
+    # OC_CLIENT_URL を env で指定すれば自動検出をスキップして固定 URL を使う。
+    # 未指定なら ClusterVersion CR からクラスタの y-stream を取得し、
+    # stable-X.Y チャネル (z は最新) の oc を取りに行く。検出失敗時は stable に fallback。
+    OC_CLIENT_URL="${OC_CLIENT_URL:-}"
+    OC_CLIENT_URL_FALLBACK="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz"
     OC_BIN_DIR="/tmp/bin"
+    K8S_API="https://kubernetes.default.svc"
+    K8S_CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    K8S_TOKEN_FILE="/var/run/secrets/kubernetes.io/serviceaccount/token"
     ERRORS=0
     APPROVED=0
     SKIPPED=0
@@ -36,6 +43,32 @@ data:
     warn() { log "WARN  $*"; }
     err()  { log "ERROR $*"; ERRORS=$((ERRORS + 1)); }
 
+    # ClusterVersion CR から OCP の y-stream (X.Y) を標準出力する。
+    # oc がまだ無い段階で呼ばれるため、curl + ServiceAccount トークンで直接 API を叩く。
+    detect_cluster_y_stream() {
+      local token cv ver
+      if [[ ! -r "$K8S_TOKEN_FILE" || ! -r "$K8S_CA" ]]; then
+        return 1
+      fi
+      token="$(cat "$K8S_TOKEN_FILE")"
+      if ! cv="$(curl --silent --show-error --fail --cacert "$K8S_CA" \
+            -H "Authorization: Bearer ${token}" \
+            --connect-timeout 10 --max-time 30 \
+            "${K8S_API}/apis/config.openshift.io/v1/clusterversions/version" 2>/dev/null)"; then
+        return 1
+      fi
+      # status.desired.version は "X.Y.Z" or "X.Y.Z-suffix" 形式 (例: 4.14.5)
+      ver="$(printf '%s' "$cv" \
+        | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+[^"]*"' \
+        | head -n1 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+      if [[ "$ver" =~ ^([0-9]+\.[0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+      fi
+      return 1
+    }
+
     # bootstrap: oc が PATH にあれば使い、無ければ OpenShift mirror から取得する。
     # readOnlyRootFilesystem 下で動かすため、書き込み先は /tmp emptyDir 配下に限定。
     bootstrap_oc() {
@@ -43,12 +76,25 @@ data:
         info "bootstrap: using oc at $(command -v oc)"
         return 0
       fi
-      info "bootstrap: oc not found, downloading from ${OC_CLIENT_URL}"
+      local url="$OC_CLIENT_URL"
+      if [[ -z "$url" ]]; then
+        local y
+        if y="$(detect_cluster_y_stream)"; then
+          url="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${y}/openshift-client-linux.tar.gz"
+          info "bootstrap: detected cluster y-stream ${y}"
+        else
+          url="$OC_CLIENT_URL_FALLBACK"
+          warn "bootstrap: could not detect cluster y-stream, falling back to ${url}"
+        fi
+      else
+        info "bootstrap: OC_CLIENT_URL override in effect"
+      fi
+      info "bootstrap: downloading oc from ${url}"
       mkdir -p "$OC_BIN_DIR"
       if ! curl --silent --show-error --location --fail --connect-timeout 10 --max-time 120 \
-          "$OC_CLIENT_URL" \
+          "$url" \
           | tar -xz -C "$OC_BIN_DIR" oc; then
-        err "bootstrap: failed to fetch oc from ${OC_CLIENT_URL}"
+        err "bootstrap: failed to fetch oc from ${url}"
         return 1
       fi
       chmod +x "${OC_BIN_DIR}/oc"
