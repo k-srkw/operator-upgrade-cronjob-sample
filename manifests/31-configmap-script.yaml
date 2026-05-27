@@ -18,11 +18,15 @@ data:
     #     同一 channel 内 z-release (MAJOR/MINOR 不変・PATCH 増加) のみ approve
     #   - それ以外は skip し、理由をログに残す
     #
-    # 依存: oc のみ (jsonpath / go-template 出力で完結。jq には依存しない)
+    # 依存: oc のみ (jsonpath 出力で完結。jq には依存しない)
+    # ubi10-minimal ベースの実行環境では oc が同梱されないため、起動時に OpenShift
+    # mirror から oc バイナリを取得して /tmp/bin に展開する (bootstrap セクション参照)。
     set -u
     set -o pipefail
 
     ALLOWLIST_FILE="/etc/approver/allowlist/allowlist"
+    OC_CLIENT_URL="${OC_CLIENT_URL:-https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz}"
+    OC_BIN_DIR="/tmp/bin"
     ERRORS=0
     APPROVED=0
     SKIPPED=0
@@ -31,6 +35,31 @@ data:
     info() { log "INFO  $*"; }
     warn() { log "WARN  $*"; }
     err()  { log "ERROR $*"; ERRORS=$((ERRORS + 1)); }
+
+    # bootstrap: oc が PATH にあれば使い、無ければ OpenShift mirror から取得する。
+    # readOnlyRootFilesystem 下で動かすため、書き込み先は /tmp emptyDir 配下に限定。
+    bootstrap_oc() {
+      if command -v oc >/dev/null 2>&1; then
+        info "bootstrap: using oc at $(command -v oc)"
+        return 0
+      fi
+      info "bootstrap: oc not found, downloading from ${OC_CLIENT_URL}"
+      mkdir -p "$OC_BIN_DIR"
+      if ! curl --silent --show-error --location --fail --connect-timeout 10 --max-time 120 \
+          "$OC_CLIENT_URL" \
+          | tar -xz -C "$OC_BIN_DIR" oc; then
+        err "bootstrap: failed to fetch oc from ${OC_CLIENT_URL}"
+        return 1
+      fi
+      chmod +x "${OC_BIN_DIR}/oc"
+      export PATH="${OC_BIN_DIR}:${PATH}"
+      info "bootstrap: installed $(${OC_BIN_DIR}/oc version --client=true 2>/dev/null | head -n1)"
+    }
+
+    if ! bootstrap_oc; then
+      info "done: approved=0 skipped=0 errors=${ERRORS}"
+      exit 1
+    fi
 
     # CSV 名 (例: cluster-logging.v5.7.3 / grafana-operator.v5.4.2-rc.1) から
     # "MAJOR MINOR PATCH" を空白区切りで標準出力する。抽出失敗時は終了コード 1。

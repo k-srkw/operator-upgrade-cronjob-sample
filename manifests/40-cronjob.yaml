@@ -35,13 +35,18 @@ spec:
               type: RuntimeDefault
           containers:
             - name: approver
-              image: registry.access.redhat.com/openshift4/ose-cli-rhel9:latest
+              # ose-cli-rhel9 は registry.redhat.io への terms acceptance が必要で
+              # registry.access.redhat.com からは認証なしで pull できないため、
+              # 認証不要な ubi10-minimal を使い、起動時に OpenShift mirror から
+              # oc バイナリを取得する (詳細は approve.sh の bootstrap セクション参照)
+              image: registry.access.redhat.com/ubi10/ubi-minimal:latest
               imagePullPolicy: IfNotPresent
               command:
                 - /bin/bash
                 - /etc/approver/script/approve.sh
               env:
-                # readOnlyRootFilesystem 下で oc の discovery cache 書き込み先を /tmp に向ける
+                # readOnlyRootFilesystem 下で oc の discovery cache・取得バイナリの
+                # 書き込み先を /tmp emptyDir に向ける
                 - name: HOME
                   value: /tmp
               securityContext:

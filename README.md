@@ -30,8 +30,12 @@ OpenShift で `installPlanApproval: Manual` に設定された Operator Subscrip
 
 - OpenShift 4.x クラスター
 - 初期投入は `cluster-admin` 相当の権限が必要 (ClusterRole / ClusterRoleBinding の作成のため)
-- 実行用イメージは `registry.access.redhat.com/openshift4/ose-cli-rhel9:latest`
+- 実行用イメージは `registry.access.redhat.com/ubi10/ubi-minimal:latest`
   (Pull に追加認証は不要)
+- Job Pod から OpenShift mirror (`https://mirror.openshift.com`) へ HTTPS で
+  アクセスできること。ubi-minimal には `oc` が同梱されないため、起動時に
+  `openshift-client-linux.tar.gz` を取得して `/tmp/bin/oc` に展開する。
+  別 URL を指定したい場合は CronJob の env に `OC_CLIENT_URL` を設定する
 
 ## デプロイ手順
 
