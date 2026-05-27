@@ -1,0 +1,84 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: installplan-approver
+  namespace: operator-upgrade-approver
+  labels:
+    app.kubernetes.io/name: installplan-approver
+    app.kubernetes.io/part-of: operator-upgrade-approver
+spec:
+  # TODO: 実運用のメンテナンス時間に変更すること
+  # 下記はプレースホルダ (UTC で毎週金曜 17:00 = JST 土曜 02:00)
+  schedule: "0 17 * * 5"
+  # TODO: OCP 4.14+ (Kubernetes 1.27+) であれば timeZone でローカル時間指定が可能
+  # timeZone: "Asia/Tokyo"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: installplan-approver
+            app.kubernetes.io/part-of: operator-upgrade-approver
+        spec:
+          serviceAccountName: installplan-approver
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: approver
+              # ose-cli-rhel9 は registry.redhat.io への terms acceptance が必要で
+              # registry.access.redhat.com からは認証なしで pull できない。
+              # ubi-minimal は tar/gzip を含まないため oc 取得時に解凍できない。
+              # tar/gzip 同梱の full UBI を使い、起動時に OpenShift mirror から
+              # oc バイナリを取得する (詳細は approve.sh の bootstrap セクション参照)
+              image: registry.access.redhat.com/ubi10/ubi:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - /etc/approver/script/approve.sh
+              env:
+                # readOnlyRootFilesystem 下で oc の discovery cache・取得バイナリの
+                # 書き込み先を /tmp emptyDir に向ける
+                - name: HOME
+                  value: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 200m
+                  memory: 256Mi
+              volumeMounts:
+                - name: allowlist
+                  mountPath: /etc/approver/allowlist
+                  readOnly: true
+                - name: script
+                  mountPath: /etc/approver/script
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: allowlist
+              configMap:
+                name: installplan-approver-allowlist
+            - name: script
+              configMap:
+                name: installplan-approver-script
+                defaultMode: 0555
+            - name: tmp
+              emptyDir: {}

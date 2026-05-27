@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: operator-upgrade-approver
+  labels:
+    app.kubernetes.io/name: installplan-approver
+    app.kubernetes.io/part-of: operator-upgrade-approver
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

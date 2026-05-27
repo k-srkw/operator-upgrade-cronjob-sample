@@ -1,0 +1,225 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: installplan-approver-script
+  namespace: operator-upgrade-approver
+  labels:
+    app.kubernetes.io/name: installplan-approver
+    app.kubernetes.io/part-of: operator-upgrade-approver
+data:
+  approve.sh: |
+    #!/usr/bin/env bash
+    # InstallPlan 自動承認スクリプト
+    #
+    # 動作:
+    #   - /etc/approver/allowlist/allowlist に列挙された <ns>/<sub> を順に処理
+    #   - 各 Subscription の status.installPlanRef が指す InstallPlan を取得
+    #   - spec.installPlanApproval=Manual かつ spec.approved=false かつ
+    #     同一 channel 内 z-release (MAJOR/MINOR 不変・PATCH 増加) のみ approve
+    #   - それ以外は skip し、理由をログに残す
+    #
+    # 依存: oc のみ (jsonpath 出力で完結。jq には依存しない)
+    # ubi10-minimal ベースの実行環境では oc が同梱されないため、起動時に OpenShift
+    # mirror から oc バイナリを取得して /tmp/bin に展開する (bootstrap セクション参照)。
+    set -u
+    set -o pipefail
+
+    ALLOWLIST_FILE="/etc/approver/allowlist/allowlist"
+    # OC_CLIENT_URL を env で指定すれば自動検出をスキップして固定 URL を使う。
+    # 未指定なら ClusterVersion CR からクラスタの y-stream を取得し、
+    # stable-X.Y チャネル (z は最新) の oc を取りに行く。検出失敗時は stable に fallback。
+    OC_CLIENT_URL="${OC_CLIENT_URL:-}"
+    OC_CLIENT_URL_FALLBACK="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz"
+    OC_BIN_DIR="/tmp/bin"
+    K8S_API="https://kubernetes.default.svc"
+    K8S_CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    K8S_TOKEN_FILE="/var/run/secrets/kubernetes.io/serviceaccount/token"
+    ERRORS=0
+    APPROVED=0
+    SKIPPED=0
+
+    log()  { printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+    info() { log "INFO  $*"; }
+    warn() { log "WARN  $*"; }
+    err()  { log "ERROR $*"; ERRORS=$((ERRORS + 1)); }
+
+    # ClusterVersion CR から OCP の y-stream (X.Y) を標準出力する。
+    # oc がまだ無い段階で呼ばれるため、curl + ServiceAccount トークンで直接 API を叩く。
+    detect_cluster_y_stream() {
+      local token cv ver
+      if [[ ! -r "$K8S_TOKEN_FILE" || ! -r "$K8S_CA" ]]; then
+        return 1
+      fi
+      token="$(cat "$K8S_TOKEN_FILE")"
+      if ! cv="$(curl --silent --show-error --fail --cacert "$K8S_CA" \
+            -H "Authorization: Bearer ${token}" \
+            --connect-timeout 10 --max-time 30 \
+            "${K8S_API}/apis/config.openshift.io/v1/clusterversions/version" 2>/dev/null)"; then
+        return 1
+      fi
+      # status.desired.version は "X.Y.Z" or "X.Y.Z-suffix" 形式 (例: 4.14.5)
+      ver="$(printf '%s' "$cv" \
+        | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+[^"]*"' \
+        | head -n1 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+      if [[ "$ver" =~ ^([0-9]+\.[0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+      fi
+      return 1
+    }
+
+    # bootstrap: oc が PATH にあれば使い、無ければ OpenShift mirror から取得する。
+    # readOnlyRootFilesystem 下で動かすため、書き込み先は /tmp emptyDir 配下に限定。
+    bootstrap_oc() {
+      if command -v oc >/dev/null 2>&1; then
+        info "bootstrap: using oc at $(command -v oc)"
+        return 0
+      fi
+      local url="$OC_CLIENT_URL"
+      if [[ -z "$url" ]]; then
+        local y
+        if y="$(detect_cluster_y_stream)"; then
+          url="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${y}/openshift-client-linux.tar.gz"
+          info "bootstrap: detected cluster y-stream ${y}"
+        else
+          url="$OC_CLIENT_URL_FALLBACK"
+          warn "bootstrap: could not detect cluster y-stream, falling back to ${url}"
+        fi
+      else
+        info "bootstrap: OC_CLIENT_URL override in effect"
+      fi
+      info "bootstrap: downloading oc from ${url}"
+      mkdir -p "$OC_BIN_DIR"
+      if ! curl --silent --show-error --location --fail --connect-timeout 10 --max-time 120 \
+          "$url" \
+          | tar -xz -C "$OC_BIN_DIR" oc; then
+        err "bootstrap: failed to fetch oc from ${url}"
+        return 1
+      fi
+      chmod +x "${OC_BIN_DIR}/oc"
+      export PATH="${OC_BIN_DIR}:${PATH}"
+      info "bootstrap: installed $(${OC_BIN_DIR}/oc version --client=true 2>/dev/null | head -n1)"
+    }
+
+    if ! bootstrap_oc; then
+      info "done: approved=0 skipped=0 errors=${ERRORS}"
+      exit 1
+    fi
+
+    # CSV 名 (例: cluster-logging.v5.7.3 / grafana-operator.v5.4.2-rc.1) から
+    # "MAJOR MINOR PATCH" を空白区切りで標準出力する。抽出失敗時は終了コード 1。
+    extract_version() {
+      local csv="$1"
+      [[ -z "$csv" ]] && return 1
+      if [[ "$csv" =~ v?([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        printf '%s %s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        return 0
+      fi
+      return 1
+    }
+
+    if [[ ! -r "$ALLOWLIST_FILE" ]]; then
+      err "allowlist not readable at $ALLOWLIST_FILE"
+      exit 1
+    fi
+
+    info "start: scanning allowlist $ALLOWLIST_FILE"
+
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+      line="${raw_line%%#*}"
+      line="${line//[$'\t\r ']/}"
+      [[ -z "$line" ]] && continue
+
+      if [[ "$line" != */* ]]; then
+        err "invalid entry (expected <namespace>/<subscription>): $raw_line"
+        continue
+      fi
+      ns="${line%%/*}"
+      sub="${line#*/}"
+      if [[ -z "$ns" || -z "$sub" ]]; then
+        err "invalid entry (empty namespace or subscription): $raw_line"
+        continue
+      fi
+
+      info "processing: ${ns}/${sub}"
+
+      # Subscription から必要 5 フィールドを `|` 区切りで一括取得 (該当フィールドに `|` は現れない)
+      sub_tpl='{.spec.installPlanApproval}|{.status.installPlanRef.name}|{.status.installPlanRef.namespace}|{.status.installedCSV}|{.spec.channel}'
+      if ! sub_out="$(oc get subscription -n "$ns" "$sub" -o "jsonpath=${sub_tpl}" 2>/dev/null)"; then
+        err "subscription not found: ${ns}/${sub}"
+        continue
+      fi
+      IFS='|' read -r approval ip_name ip_ns installed_csv channel <<<"$sub_out"
+
+      if [[ "$approval" != "Manual" ]]; then
+        SKIPPED=$((SKIPPED + 1))
+        warn "skip ${ns}/${sub}: installPlanApproval is '${approval}', not Manual"
+        continue
+      fi
+
+      if [[ -z "$ip_name" || -z "$ip_ns" ]]; then
+        SKIPPED=$((SKIPPED + 1))
+        info "skip ${ns}/${sub}: no pending installPlanRef (nothing to approve)"
+        continue
+      fi
+
+      ip_tpl='{.spec.approved}|{.spec.clusterServiceVersionNames[0]}'
+      if ! ip_out="$(oc get installplan -n "$ip_ns" "$ip_name" -o "jsonpath=${ip_tpl}" 2>/dev/null)"; then
+        err "installplan not found: ${ip_ns}/${ip_name} (from ${ns}/${sub})"
+        continue
+      fi
+      IFS='|' read -r approved target_csv <<<"$ip_out"
+
+      if [[ "$approved" == "true" ]]; then
+        SKIPPED=$((SKIPPED + 1))
+        info "skip ${ns}/${sub}: installplan ${ip_ns}/${ip_name} already approved (target: ${target_csv})"
+        continue
+      fi
+
+      # z-release ガード
+      if [[ -z "$installed_csv" ]]; then
+        SKIPPED=$((SKIPPED + 1))
+        info "skip ${ns}/${sub}: installedCSV is empty (initial install, not an upgrade)"
+        continue
+      fi
+
+      if ! from_ver="$(extract_version "$installed_csv")"; then
+        SKIPPED=$((SKIPPED + 1))
+        warn "skip ${ns}/${sub}: cannot parse version from installedCSV '${installed_csv}'"
+        continue
+      fi
+      if ! to_ver="$(extract_version "$target_csv")"; then
+        SKIPPED=$((SKIPPED + 1))
+        warn "skip ${ns}/${sub}: cannot parse version from target CSV '${target_csv}'"
+        continue
+      fi
+
+      read -r from_major from_minor from_patch <<<"$from_ver"
+      read -r to_major   to_minor   to_patch   <<<"$to_ver"
+
+      if (( from_major != to_major )) || (( from_minor != to_minor )); then
+        SKIPPED=$((SKIPPED + 1))
+        warn "skip ${ns}/${sub}: y-stream / major upgrade detected on channel '${channel}': ${installed_csv} -> ${target_csv}"
+        continue
+      fi
+      if (( to_patch <= from_patch )); then
+        SKIPPED=$((SKIPPED + 1))
+        warn "skip ${ns}/${sub}: target patch version is not greater than installed: ${installed_csv} -> ${target_csv}"
+        continue
+      fi
+
+      info "approving ${ns}/${sub}: ${installed_csv} -> ${target_csv} (installplan ${ip_ns}/${ip_name}, channel '${channel}')"
+      if oc patch installplan -n "$ip_ns" "$ip_name" --type=merge -p '{"spec":{"approved":true}}' >/dev/null; then
+        APPROVED=$((APPROVED + 1))
+        info "approved ${ip_ns}/${ip_name}"
+      else
+        err "failed to patch installplan ${ip_ns}/${ip_name}"
+      fi
+    done < "$ALLOWLIST_FILE"
+
+    info "done: approved=${APPROVED} skipped=${SKIPPED} errors=${ERRORS}"
+    if (( ERRORS > 0 )); then
+      exit 1
+    fi
+    exit 0
